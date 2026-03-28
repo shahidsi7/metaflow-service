@@ -91,6 +91,9 @@ class ListenNotify(object):
                 # Heartbeat watcher for Runs.
                 if table.table_name == self.db.run_table_postgres.table_name:
                     self.event_emitter.emit('run-heartbeat', 'update', data)
+                    # Notify AutoCompleteApi to refresh tag cache on new runs
+                    if operation == "INSERT":
+                        self.event_emitter.emit('run.created', data)
 
                 # Heartbeat watcher for Tasks.
                 if table.table_name == self.db.task_table_postgres.table_name:

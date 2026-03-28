@@ -9,20 +9,43 @@ TAGS_FILL_INTERVAL_SECONDS = 60 * 5
 
 class AutoCompleteApi(object):
 
-    def __init__(self, app, db):
+    def __init__(self, app, db, event_emitter=None):
         self.db = db
         # Cached resources
         # Cache tags so we don't have to request DB everytime
         self.tags = []
         self.logger = logging.getLogger("AutoCompleteApi")
+        self._debounce_task = None  # track pending debounce task
         app.router.add_route("GET", "/tags/autocomplete", self.get_tags)
         # Non-cached resources
         app.router.add_route("GET", "/flows/autocomplete", self.get_flows)
         app.router.add_route("GET", "/flows/{flow_id}/runs/autocomplete", self.get_runs_for_flow)
         app.router.add_route("GET", "/flows/{flow_id}/runs/{run_id}/steps/autocomplete", self.get_steps_for_run)
         app.router.add_route("GET", "/flows/{flow_id}/runs/{run_id}/artifacts/autocomplete", self.get_artifacts_for_run)
+
+        # Subscribe to run.created events for near-real-time cache refresh
+        if event_emitter is not None:
+            event_emitter.on("run.created", self.on_run_created)
+
         loop = asyncio.get_event_loop()
         loop.create_task(self.periodic_tags_fetch_and_cache())
+
+    async def on_run_created(self, data):
+        '''
+        Called when a new run INSERT is detected via the event emitter.
+        Debounces rapid consecutive calls to avoid hammering the DB.
+        '''
+        # Cancel any existing pending debounce
+        if self._debounce_task is not None and not self._debounce_task.done():
+            self._debounce_task.cancel()
+
+        async def _debounced():
+            await asyncio.sleep(10)  # 10 second debounce window
+            await self.update_cached_tags()
+
+        loop = asyncio.get_event_loop()
+        self._debounce_task = loop.create_task(_debounced())
+
 
     async def periodic_tags_fetch_and_cache(self):
         '''
