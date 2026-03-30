@@ -1,4 +1,14 @@
-FROM golang:1.18.9-buster
+FROM golang:1.20.2-buster as amd64-golang
+FROM arm64v8/golang:1.20.2-buster as arm64-golang
+
+FROM ${TARGETARCH}-golang as goose
+RUN go install github.com/pressly/goose/v3/cmd/goose@v3.9.0
+
+# ── base stage ────────────────────────────────────────────────────────────────
+# Contains all system dependencies and source code.
+# Shared by both runtime and dev stages.
+FROM python:3.11.6-slim-bookworm AS base
+COPY --from=goose /go/bin/goose /usr/local/bin/
 
 ARG BUILD_TIMESTAMP
 ARG BUILD_COMMIT_HASH
@@ -6,20 +16,21 @@ ENV BUILD_TIMESTAMP=$BUILD_TIMESTAMP
 ENV BUILD_COMMIT_HASH=$BUILD_COMMIT_HASH
 
 ARG UI_ENABLED="1"
-ARG UI_VERSION="v1.2.5"
+ARG UI_VERSION="v1.3.13"
 ENV UI_ENABLED=$UI_ENABLED
 ENV UI_VERSION=$UI_VERSION
 
 ENV FEATURE_RUN_GROUPS=0
 ENV FEATURE_DEBUG_VIEW=1
 
-RUN go install github.com/pressly/goose/v3/cmd/goose@v3.5.3
+RUN apt-get update -y \
+    && apt-get -y install libpq-dev unzip gcc curl
 
-RUN apt-get update -y && apt-get -y install python3.7 && apt-get -y install python3-pip && apt-get -y install libpq-dev unzip
+RUN pip3 install virtualenv requests
 
-RUN pip3 install virtualenv && pip3 install requests
-
+# TODO: possibly unused virtualenv. See if it can be removed
 RUN virtualenv /opt/v_1_0_1 -p python3
+# All of the official deployment templates reference this virtualenv for launching services.
 RUN virtualenv /opt/latest -p python3
 
 RUN /opt/v_1_0_1/bin/pip install https://github.com/Netflix/metaflow-service/archive/1.0.1.zip
@@ -32,7 +43,6 @@ ADD services/ui_backend_service /root/services/ui_backend_service
 ADD services/utils /root/services/utils
 ADD setup.py setup.cfg run_goose.py /root/
 WORKDIR /root
-RUN /opt/latest/bin/pip install .
 
 # Install Netflix/metaflow-ui release artifact
 RUN /root/services/ui_backend_service/download_ui.sh
@@ -40,6 +50,27 @@ RUN /root/services/ui_backend_service/download_ui.sh
 # Migration Service
 ADD services/migration_service /root/services/migration_service
 RUN pip3 install -r /root/services/migration_service/requirements.txt
-
 RUN chmod 777 /root/services/migration_service/run_script.py
-CMD python3  services/migration_service/run_script.py
+
+# ── runtime stage ─────────────────────────────────────────────────────────────
+# Production image. Self-contained, no volume mounts needed.
+# This is the stage pushed to the registry by CI.
+FROM base AS runtime
+RUN /opt/latest/bin/pip install .
+CMD python3 services/migration_service/run_script.py
+
+# ── dev stage ─────────────────────────────────────────────────────────────────
+# Development image. Editable install so that the volume-mounted
+# ./services directory is the live source — no rebuild needed on code change.
+FROM base AS dev
+RUN /opt/latest/bin/pip install --editable .
+CMD python3 services/migration_service/run_script.py
+
+# ── test stage ────────────────────────────────────────────────────────────────
+# Shares the same base as dev and runtime — prevents dev/test version drift.
+# Replaces the standalone Dockerfile.service.test.
+FROM base AS test
+RUN pip3 install tox
+COPY . /app
+WORKDIR /app
+CMD ["/app/wait-for-postgres.sh", "tox"]
